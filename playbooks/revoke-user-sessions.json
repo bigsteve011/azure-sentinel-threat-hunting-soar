@@ -1,0 +1,119 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Sentinel playbook: when an incident is created, revoke the sign-in sessions of every Account entity and add a comment to the incident. Uses a system-assigned managed identity (grant it the Microsoft Graph User.RevokeSessions.All application permission and the Microsoft Sentinel Responder role)."
+  },
+  "parameters": {
+    "PlaybookName": { "type": "string", "defaultValue": "Revoke-RiskyUser-Sessions" }
+  },
+  "variables": {
+    "SentinelConnectionName": "[concat('azuresentinel-', parameters('PlaybookName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('SentinelConnectionName')]",
+      "location": "[resourceGroup().location]",
+      "kind": "V1",
+      "properties": {
+        "displayName": "[variables('SentinelConnectionName')]",
+        "parameterValueType": "Alternative",
+        "api": {
+          "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/azuresentinel')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('PlaybookName')]",
+      "location": "[resourceGroup().location]",
+      "identity": { "type": "SystemAssigned" },
+      "tags": { "hidden-SentinelTemplateName": "Revoke-RiskyUser-Sessions" },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/connections', variables('SentinelConnectionName'))]"
+      ],
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "$connections": { "defaultValue": {}, "type": "Object" }
+          },
+          "triggers": {
+            "Microsoft_Sentinel_incident": {
+              "type": "ApiConnectionWebhook",
+              "inputs": {
+                "host": { "connection": { "name": "@parameters('$connections')['azuresentinel']['connectionId']" } },
+                "body": { "callback_url": "@{listCallbackUrl()}" },
+                "path": "/incident-creation"
+              }
+            }
+          },
+          "actions": {
+            "Entities_-_Get_Accounts": {
+              "type": "ApiConnection",
+              "inputs": {
+                "host": { "connection": { "name": "@parameters('$connections')['azuresentinel']['connectionId']" } },
+                "method": "post",
+                "body": "@triggerBody()?['object']?['properties']?['relatedEntities']",
+                "path": "/entities/account"
+              }
+            },
+            "For_each_account": {
+              "type": "Foreach",
+              "foreach": "@body('Entities_-_Get_Accounts')?['Accounts']",
+              "runAfter": { "Entities_-_Get_Accounts": ["Succeeded"] },
+              "actions": {
+                "Revoke_sign_in_sessions": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "https://graph.microsoft.com/v1.0/users/@{encodeUriComponent(concat(items('For_each_account')?['Name'], '@', items('For_each_account')?['UPNSuffix']))}/revokeSignInSessions",
+                    "authentication": { "type": "ManagedServiceIdentity", "audience": "https://graph.microsoft.com" }
+                  }
+                },
+                "Comment_on_incident": {
+                  "type": "ApiConnection",
+                  "runAfter": { "Revoke_sign_in_sessions": ["Succeeded"] },
+                  "inputs": {
+                    "host": { "connection": { "name": "@parameters('$connections')['azuresentinel']['connectionId']" } },
+                    "method": "post",
+                    "body": {
+                      "incidentArmId": "@triggerBody()?['object']?['id']",
+                      "message": "<p>Playbook revoked all sign-in sessions for @{items('For_each_account')?['Name']}@@@{items('For_each_account')?['UPNSuffix']}.</p>"
+                    },
+                    "path": "/Incidents/Comment"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "azuresentinel": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('SentinelConnectionName'))]",
+                "connectionName": "[variables('SentinelConnectionName')]",
+                "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', resourceGroup().location, '/managedApis/azuresentinel')]",
+                "connectionProperties": {
+                  "authentication": { "type": "ManagedServiceIdentity" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "playbookPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('PlaybookName')), '2019-05-01', 'full').identity.principalId]"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+// Two successful sign-ins for the same user from locations that would need >900 km/h travel.
+// MITRE ATT&CK: T1078 (Valid Accounts)
+let lookback = 1d;
+let maxSpeedKmh = 900.0;
+SigninLogs
+| where TimeGenerated > ago(lookback)
+| where ResultType == "0"
+| extend Lat = toreal(LocationDetails.geoCoordinates.latitude),
+         Lon = toreal(LocationDetails.geoCoordinates.longitude)
+| where isnotnull(Lat) and isnotnull(Lon)
+| project TimeGenerated, UserPrincipalName, IPAddress, Lat, Lon, City = tostring(LocationDetails.city)
+| sort by UserPrincipalName asc, TimeGenerated asc
+| extend PrevTime = prev(TimeGenerated), PrevLat = prev(Lat), PrevLon = prev(Lon),
+         PrevIP = prev(IPAddress), PrevCity = prev(City), PrevUser = prev(UserPrincipalName)
+| where UserPrincipalName == PrevUser and IPAddress != PrevIP
+| extend DistanceKm = geo_distance_2points(PrevLon, PrevLat, Lon, Lat) / 1000.0,
+         Hours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0
+| where Hours > 0
+| extend SpeedKmh = DistanceKm / Hours
+| where SpeedKmh > maxSpeedKmh
+| project UserPrincipalName, PrevTime, PrevCity, PrevIP, TimeGenerated, City, IPAddress,
+          DistanceKm = round(DistanceKm, 0), SpeedKmh = round(SpeedKmh, 0)
